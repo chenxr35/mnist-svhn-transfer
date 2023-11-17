@@ -5,6 +5,8 @@ import os
 import pickle
 import scipy.io
 import numpy as np
+import cv2
+import matplotlib.pyplot as plt
 
 from torch.autograd import Variable
 from torch import optim
@@ -37,49 +39,66 @@ class Solver(object):
         self.sample_path = config.sample_path
         self.model_path = config.model_path
         self.build_model()
-        
+
     def build_model(self):
         """Builds a generator and a discriminator."""
         self.g12 = G12(conv_dim=self.g_conv_dim)
         self.g21 = G21(conv_dim=self.g_conv_dim)
         self.d1 = D1(conv_dim=self.d_conv_dim, use_labels=self.use_labels)
         self.d2 = D2(conv_dim=self.d_conv_dim, use_labels=self.use_labels)
-        
+
         g_params = list(self.g12.parameters()) + list(self.g21.parameters())
         d_params = list(self.d1.parameters()) + list(self.d2.parameters())
-        
+
         self.g_optimizer = optim.Adam(g_params, self.lr, [self.beta1, self.beta2])
         self.d_optimizer = optim.Adam(d_params, self.lr, [self.beta1, self.beta2])
-        
+
         if torch.cuda.is_available():
             self.g12.cuda()
             self.g21.cuda()
             self.d1.cuda()
             self.d2.cuda()
-    
+
     def merge_images(self, sources, targets, k=10):
         _, _, h, w = sources.shape
         row = int(np.sqrt(self.batch_size))
-        merged = np.zeros([3, row*h, row*w*2])
+        merged = np.zeros([3, row * h, row * w * 2])
         for idx, (s, t) in enumerate(zip(sources, targets)):
             i = idx // row
             j = idx % row
-            merged[:, i*h:(i+1)*h, (j*2)*h:(j*2+1)*h] = s
-            merged[:, i*h:(i+1)*h, (j*2+1)*h:(j*2+2)*h] = t
+            for k in range(s.shape[0]):
+                s[k, :, :] = (s[k, :, :] * 0.5 + 0.5) * 255
+            for k in range(t.shape[0]):
+                t[k, :, :] = (t[k, :, :] * 0.5 + 0.5) * 255
+            merged[:, i * h:(i + 1) * h, (j * 2) * h:(j * 2 + 1) * h] = s
+            merged[:, i * h:(i + 1) * h, (j * 2 + 1) * h:(j * 2 + 2) * h] = t
         return merged.transpose(1, 2, 0)
-    
+
+    def save_images(self, sources, targets, source_path, target_path):
+        os.makedirs(source_path, exist_ok=True)
+        os.makedirs(target_path, exist_ok=True)
+        for idx, (s, t) in enumerate(zip(sources, targets)):
+            s = s.transpose(1, 2, 0)
+            t = t.transpose(1, 2, 0)
+            for j in range(s.shape[2]):
+                s[:, :, j] = (s[:, :, j] * 0.5 + 0.5) * 255
+            for j in range(t.shape[2]):
+                t[:, :, j] = (t[:, :, j] * 0.5 + 0.5) * 255
+            cv2.imwrite(f'{source_path}/{idx}.png', s)
+            cv2.imwrite(f'{target_path}/{idx}.png', t)
+
     def to_var(self, x):
         """Converts numpy to variable."""
         if torch.cuda.is_available():
             x = x.cuda()
         return Variable(x)
-    
+
     def to_data(self, x):
         """Converts variable to numpy."""
         if torch.cuda.is_available():
             x = x.cpu()
         return x.data.numpy()
-    
+
     def reset_grad(self):
         """Zeros the gradient buffers."""
         self.g_optimizer.zero_grad()
@@ -89,54 +108,54 @@ class Solver(object):
         svhn_iter = iter(self.svhn_loader)
         mnist_iter = iter(self.mnist_loader)
         iter_per_epoch = min(len(svhn_iter), len(mnist_iter))
-        
+
         # fixed mnist and svhn for sampling
-        fixed_svhn = self.to_var(svhn_iter.next()[0])
-        fixed_mnist = self.to_var(mnist_iter.next()[0])
-        
+        fixed_svhn = self.to_var(next(svhn_iter)[0])
+        fixed_mnist = self.to_var(next(mnist_iter)[0])
+
         # loss if use_labels = True
         criterion = nn.CrossEntropyLoss()
-        
-        for step in range(self.train_iters+1):
+
+        for step in range(self.train_iters + 1):
             # reset data_iter for each epoch
-            if (step+1) % iter_per_epoch == 0:
+            if (step + 1) % iter_per_epoch == 0:
                 mnist_iter = iter(self.mnist_loader)
                 svhn_iter = iter(self.svhn_loader)
-            
+
             # load svhn and mnist dataset
-            svhn, s_labels = svhn_iter.next() 
+            svhn, s_labels = next(svhn_iter)
             svhn, s_labels = self.to_var(svhn), self.to_var(s_labels).long().squeeze()
-            mnist, m_labels = mnist_iter.next() 
+            mnist, m_labels = next(mnist_iter)
             mnist, m_labels = self.to_var(mnist), self.to_var(m_labels)
 
             if self.use_labels:
                 mnist_fake_labels = self.to_var(
-                    torch.Tensor([self.num_classes]*svhn.size(0)).long())
+                    torch.Tensor([self.num_classes] * svhn.size(0)).long())
                 svhn_fake_labels = self.to_var(
-                    torch.Tensor([self.num_classes]*mnist.size(0)).long())
-            
-            #============ train D ============#
-            
+                    torch.Tensor([self.num_classes] * mnist.size(0)).long())
+
+            # ============ train D ============#
+
             # train with real images
             self.reset_grad()
             out = self.d1(mnist)
             if self.use_labels:
                 d1_loss = criterion(out, m_labels)
             else:
-                d1_loss = torch.mean((out-1)**2)
-            
+                d1_loss = torch.mean((out - 1) ** 2)
+
             out = self.d2(svhn)
             if self.use_labels:
                 d2_loss = criterion(out, s_labels)
             else:
-                d2_loss = torch.mean((out-1)**2)
-            
+                d2_loss = torch.mean((out - 1) ** 2)
+
             d_mnist_loss = d1_loss
             d_svhn_loss = d2_loss
             d_real_loss = d1_loss + d2_loss
             d_real_loss.backward()
             self.d_optimizer.step()
-            
+
             # train with fake images
             self.reset_grad()
             fake_svhn = self.g12(mnist)
@@ -144,33 +163,33 @@ class Solver(object):
             if self.use_labels:
                 d2_loss = criterion(out, svhn_fake_labels)
             else:
-                d2_loss = torch.mean(out**2)
-            
+                d2_loss = torch.mean(out ** 2)
+
             fake_mnist = self.g21(svhn)
             out = self.d1(fake_mnist)
             if self.use_labels:
                 d1_loss = criterion(out, mnist_fake_labels)
             else:
-                d1_loss = torch.mean(out**2)
-            
+                d1_loss = torch.mean(out ** 2)
+
             d_fake_loss = d1_loss + d2_loss
             d_fake_loss.backward()
             self.d_optimizer.step()
-            
-            #============ train G ============#
-            
+
+            # ============ train G ============#
+
             # train mnist-svhn-mnist cycle
             self.reset_grad()
             fake_svhn = self.g12(mnist)
             out = self.d2(fake_svhn)
             reconst_mnist = self.g21(fake_svhn)
             if self.use_labels:
-                g_loss = criterion(out, m_labels) 
+                g_loss = criterion(out, m_labels)
             else:
-                g_loss = torch.mean((out-1)**2) 
+                g_loss = torch.mean((out - 1) ** 2)
 
             if self.use_reconst_loss:
-                g_loss += torch.mean((mnist - reconst_mnist)**2)
+                g_loss += torch.mean((mnist - reconst_mnist) ** 2)
 
             g_loss.backward()
             self.g_optimizer.step()
@@ -181,48 +200,105 @@ class Solver(object):
             out = self.d1(fake_mnist)
             reconst_svhn = self.g12(fake_mnist)
             if self.use_labels:
-                g_loss = criterion(out, s_labels) 
+                g_loss = criterion(out, s_labels)
             else:
-                g_loss = torch.mean((out-1)**2) 
+                g_loss = torch.mean((out - 1) ** 2)
 
             if self.use_reconst_loss:
-                g_loss += torch.mean((svhn - reconst_svhn)**2)
+                g_loss += torch.mean((svhn - reconst_svhn) ** 2)
 
             g_loss.backward()
             self.g_optimizer.step()
-            
+
             # print the log info
-            if (step+1) % self.log_step == 0:
+            if (step + 1) % self.log_step == 0:
                 print('Step [%d/%d], d_real_loss: %.4f, d_mnist_loss: %.4f, d_svhn_loss: %.4f, '
-                      'd_fake_loss: %.4f, g_loss: %.4f' 
-                      %(step+1, self.train_iters, d_real_loss.data[0], d_mnist_loss.data[0], 
-                        d_svhn_loss.data[0], d_fake_loss.data[0], g_loss.data[0]))
+                      'd_fake_loss: %.4f, g_loss: %.4f'
+                      % (step + 1, self.train_iters, d_real_loss.data, d_mnist_loss.data,
+                         d_svhn_loss.data, d_fake_loss.data, g_loss.data))
 
             # save the sampled images
-            if (step+1) % self.sample_step == 0:
+            if (step + 1) % self.sample_step == 0:
                 fake_svhn = self.g12(fixed_mnist)
                 fake_mnist = self.g21(fixed_svhn)
-                
+
                 mnist, fake_mnist = self.to_data(fixed_mnist), self.to_data(fake_mnist)
-                svhn , fake_svhn = self.to_data(fixed_svhn), self.to_data(fake_svhn)
-                
+                svhn, fake_svhn = self.to_data(fixed_svhn), self.to_data(fake_svhn)
+
+                #                 self.save_images(mnist, fake_svhn, 'results/mnist', 'results/fake_svhn')
+                #                 self.save_images(svhn, fake_mnist, 'results/svhn', 'results/fake_mnist')
+
                 merged = self.merge_images(mnist, fake_svhn)
-                path = os.path.join(self.sample_path, 'sample-%d-m-s.png' %(step+1))
-                scipy.misc.imsave(path, merged)
-                print ('saved %s' %path)
-                
+                path = os.path.join(self.sample_path, 'sample-%d-m-s.png' % (step + 1))
+                # scipy.misc.imsave(path, merged)
+                cv2.imwrite(path, merged)
+                print('saved %s' % path)
+
                 merged = self.merge_images(svhn, fake_mnist)
-                path = os.path.join(self.sample_path, 'sample-%d-s-m.png' %(step+1))
-                scipy.misc.imsave(path, merged)
-                print ('saved %s' %path)
-            
-            if (step+1) % 5000 == 0:
+                path = os.path.join(self.sample_path, 'sample-%d-s-m.png' % (step + 1))
+                # scipy.misc.imsave(path, merged)
+                cv2.imwrite(path, merged)
+                print('saved %s' % path)
+
+            if (step + 1) % 5000 == 0:
                 # save the model parameters for each epoch
-                g12_path = os.path.join(self.model_path, 'g12-%d.pkl' %(step+1))
-                g21_path = os.path.join(self.model_path, 'g21-%d.pkl' %(step+1))
-                d1_path = os.path.join(self.model_path, 'd1-%d.pkl' %(step+1))
-                d2_path = os.path.join(self.model_path, 'd2-%d.pkl' %(step+1))
+                g12_path = os.path.join(self.model_path, 'g12-%d.pkl' % (step + 1))
+                g21_path = os.path.join(self.model_path, 'g21-%d.pkl' % (step + 1))
+                d1_path = os.path.join(self.model_path, 'd1-%d.pkl' % (step + 1))
+                d2_path = os.path.join(self.model_path, 'd2-%d.pkl' % (step + 1))
                 torch.save(self.g12.state_dict(), g12_path)
                 torch.save(self.g21.state_dict(), g21_path)
                 torch.save(self.d1.state_dict(), d1_path)
                 torch.save(self.d2.state_dict(), d2_path)
+
+    def mnist_to_svhn(self, best_epoch):
+        mnist_iter = iter(self.mnist_loader)
+
+        for step in range(len(mnist_iter)):
+            mnist, m_labels = next(mnist_iter)
+            mnist, m_labels = self.to_var(mnist), self.to_data(m_labels)
+            self.g12.load_state_dict(torch.load(f"{self.model_path}/g12-{best_epoch}.pkl"))
+            self.g12.eval()
+            fake_svhn = self.g12(mnist)
+            fake_svhn = self.to_data(fake_svhn)
+            for idx, (img, label) in enumerate(zip(fake_svhn, m_labels)):
+                img = img.transpose(1, 2, 0)
+                for j in range(img.shape[2]):
+                    img[:, :, j] = (img[:, :, j] * 0.5 + 0.5) * 255
+                #                 plt.title(label)
+                #                 plt.imshow(img.astype('uint8'))
+                #                 plt.show()
+                img_folder = f'translations/mnist2svhn/{label}'
+                os.makedirs(img_folder, exist_ok=True)
+                img_path = f'{img_folder}/{step}_{idx}.png'
+                cv2.imwrite(img_path, img)
+
+    def mnist_to_mnist(self):
+        mnist_iter = iter(self.mnist_loader)
+
+        for step in range(len(mnist_iter)):
+            mnist, m_labels = next(mnist_iter)
+            mnist, m_labels = self.to_data(mnist), self.to_data(m_labels)
+            for idx, (img, label) in enumerate(zip(mnist, m_labels)):
+                img = img.transpose(1, 2, 0)
+                for j in range(img.shape[2]):
+                    img[:, :, j] = (img[:, :, j] * 0.5 + 0.5) * 255
+                img_folder = f'translations/mnist2mnist/{label}'
+                os.makedirs(img_folder, exist_ok=True)
+                img_path = f'{img_folder}/{step}_{idx}.png'
+                cv2.imwrite(img_path, img)
+
+    def svhn_to_svhn(self):
+        svhn_iter = iter(self.svhn_loader)
+
+        for step in range(len(svhn_iter)):
+            svhn, s_labels = next(svhn_iter)
+            svhn, s_labels = self.to_data(svhn), self.to_data(s_labels)
+            for idx, (img, label) in enumerate(zip(svhn, s_labels)):
+                img = img.transpose(1, 2, 0)
+                for j in range(img.shape[2]):
+                    img[:, :, j] = (img[:, :, j] * 0.5 + 0.5) * 255
+                img_folder = f'translations/svhn2svhn/{label}'
+                os.makedirs(img_folder, exist_ok=True)
+                img_path = f'{img_folder}/{step}_{idx}.png'
+                cv2.imwrite(img_path, img)
